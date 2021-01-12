@@ -1,20 +1,33 @@
+#include <EEPROM.h>
+
 long times = 0;
 const byte interruptPin = 2;
+const byte encoderPin = 3;
+const byte encoderPinB = 4;
 const byte outPin = 13;
 unsigned long last_time = 0;
-long milis = 999;
+uint16_t milis = 999;
+uint16_t def_milis = 500;
+uint16_t new_milis;
 unsigned long start_time = 0;
 volatile int analogVal;
 
-#define Dig1    8
-#define Dig2    5
-#define Dig3    4
-#define Dig4    3
+int address_low = 1;  // Adres EEPROM do któego zapisywana jest aktualna wartość milis
+int address_high = 0;
+// TODO: Przetestuj i dobierz te czasy tak aby dobrze zapisywało, ewentualnie daj większy kondensator na zasilanie
+float min_voltage = 4.4;  //Napięcie przy którym zapisywana jest aktualna wartość milis do EEPROM
+float normal_voltage = 4.41; // Jeżeli napięcie jest większe od tego to anulowane jest czekania na wyłączenie (waitTurnOff)
+bool waitTurnOff = false; //Prawda jeżeli napięcie jest mniejsze od min_voltage, nie zapisuj wtedy do EEPROM tylko czekaj aż się wyłączy lub zwiększy napięcie
+
+#define Dig1    10
+#define Dig2    9
+#define Dig3    8
+#define Dig4    5
 
 #define clockPin  7
 #define dataPin   6
 
-char text[5] = "HExO";
+char text[5] = "HExO";  // Powitanie "HEllO"
 
 bool is_text = true;
 byte current_digit;
@@ -23,6 +36,18 @@ void disp(byte number, bool dec_point = false);
 void disp_char(char text, bool dec_point = false);
 
 void setup() {
+  Serial.begin(9600);   // Inicjalizacja USART
+  byte milis_low = 0;
+  byte milis_high = 0;
+  EEPROM.get(address_low, milis_low);
+  EEPROM.get(address_high, milis_high);
+  milis = ((uint16_t)milis_high << 8) + milis_low;
+  Serial.print("load_milis = ");
+  Serial.println(milis);
+  if (milis < 0 || milis > 9999) {
+    milis = def_milis;
+  }
+  
   noInterrupts();   // Wyłączeniue przerwań cli()
 
   pinMode(Dig1, OUTPUT);
@@ -35,22 +60,33 @@ void setup() {
   disp_off();  // Wyłączenie wyświetlacza
   
   pinMode(interruptPin, INPUT_PULLUP);
+  pinMode(encoderPin, INPUT_PULLUP);
   pinMode(outPin, OUTPUT);
   digitalWrite(outPin, LOW);
   attachInterrupt(digitalPinToInterrupt(interruptPin), INT, CHANGE);  // Inicjalizacja przerwania zewnętrznego
+  attachInterrupt(digitalPinToInterrupt(encoderPin), INT_encoder, RISING);  // Inicjalizacja przerwania zewnętrznego
   timer2_init();   // Inicjalizacja timera
   adc_init(); // Inicjalizacja ADC
-  Serial.begin(9600);   // Inicjalizacja USART
   interrupts();   // Włączenie przerwań sei();
   start_time = millis();
   ADCSRA |=B01000000;
 }
 
 void loop() {
-  if (millis() - start_time > 1000){
+  if (millis() - start_time > 1000){  // Po wyświetleniu powitania znawsze na początku wyłącz is_text aby wyświetlić liczbę
     is_text = false;
   }
-  if (TIMSK1 & ((1 << OCIE1A)|(1 << TOIE1))) {
+  
+  if (waitTurnOff) {    // Gdy niskie napięcie zasilania pożegnaj się
+    char on_text[5] = "BYE!";
+    for(int i = 0; i < 5; i++)
+    {
+      text[i] = on_text[i];
+    }
+    is_text = true;
+  }
+
+  if (TIMSK1 & ((1 << OCIE1A)|(1 << TOIE1))) {  // Gdy zgrzewanie jest aktywne
     char on_text[5] = " ON ";
     for(int i = 0; i < 5; i++)
     {
@@ -58,6 +94,7 @@ void loop() {
     }
     is_text = true;
   }
+  
   while (Serial.available() > 0) {
     unsigned long received = Serial.parseInt();
     if (received < 10000 && received > 0) {
@@ -65,6 +102,8 @@ void loop() {
       Serial.flush();
       Serial.print("I received: ");
       Serial.println(milis);
+//      EEPROM.put(address_low, lowByte(milis));
+//      EEPROM.put(address_high, highByte(milis));
     }
   }
 }
@@ -113,15 +152,9 @@ void timer2_init() {   // Inicjalizacja timera1
 }
 
 void adc_init() {
-  // Zeruj bit ADLAR w ADMUX (0x7C)
-  // ADCL będzie zawierał 8 młodszych bitów, a ADCH 2 starsze
-  ADMUX &= B11011111;
- 
-  // Ustawia bity REFS1 i REFS0 w ADMUX (0x7C) w celu wyboru napięcia referencyjnego z nóżki AREF (5V)
-  ADMUX |= B01000000;
- 
-  // Zeruje bity MUX3-0 w ADMUX (0x7C) w celu ustawienia wejścia A0
-  ADMUX &= B11110000;
+  ADMUX = (0x01 << REFS0) /* AVCC with external capacitor at AREF pin */
+          | (0 << ADLAR) /* Left Adjust Result: disabled*/
+          | (0x0e << MUX0) /* Internal Reference (VBG) */;
   
   // Ustawia bit ADEN w ADCSRA (0x7A) aby włączyć przetwornik ADC.
   ADCSRA |= B10000000;
@@ -207,18 +240,18 @@ ISR(TIMER2_COMPA_vect)  // Przerwanie timera0 (porównanie rejestrów)
 
 // Przerwanie po odczycie ADC
 ISR(ADC_vect){
-  analogVal = ADCL | (ADCH << 8); // Odczyt zmierzonej wartości
-  long new_milis = (analogVal - 12)*2;
-  if (new_milis - milis < 20 && milis - new_milis < 20){
-    return;
+  uint16_t ADC_RES_L = ADCL;
+  uint16_t ADC_RES_H = ADCH;
+  float Vcc_value = ( 0x400 * 1.1 ) / (ADC_RES_L + ADC_RES_H * 0x100) /* calculatethe Vcc value */;
+  if (Vcc_value < min_voltage and !waitTurnOff) {
+    EEPROM.put(address_high, highByte(milis));
+    EEPROM.put(address_low, lowByte(milis));
+    waitTurnOff = true;
+    Serial.println(Vcc_value);
+  } else if (Vcc_value > normal_voltage and waitTurnOff) {
+    waitTurnOff = false;
+    Serial.println(Vcc_value);
   }
-  milis = new_milis;
-  if (milis < 1) {
-    milis = 1;
-  } else if (milis > 2000) {
-    milis = 2000;
-  }
-  Serial.println(milis);
 }
 
 void INT() {
@@ -229,6 +262,24 @@ void INT() {
   {
     set_timer(milis);
   }
+}
+
+void INT_encoder() {
+  if(digitalRead(encoderPinB) == LOW)
+  {
+    new_milis = milis - 1;
+  }
+  else
+  {
+    new_milis = milis + 1;
+  }
+  milis = new_milis;
+  if (milis < 1) {
+    milis = 1;
+  } else if (milis > 2000) {
+    milis = 2000;
+  }
+  Serial.println(milis);
 }
 
 void disp(byte number, bool dec_point)
@@ -353,6 +404,16 @@ void disp_char(char ch, bool dec_point)
       digitalWrite(clockPin, HIGH);
       digitalWrite(clockPin, LOW);
 
+    case 'B':  // Pisz B
+      shiftOut(dataPin, clockPin, MSBFIRST, 0x00 | !dec_point);
+      digitalWrite(clockPin, HIGH);
+      digitalWrite(clockPin, LOW);
+
+    case 'Y':  // Pisz Y
+      shiftOut(dataPin, clockPin, MSBFIRST, 0x88 | !dec_point);
+      digitalWrite(clockPin, HIGH);
+      digitalWrite(clockPin, LOW);
+
     case 'o':  // Pisz o
       shiftOut(dataPin, clockPin, MSBFIRST, 0xC4 | !dec_point);
       digitalWrite(clockPin, HIGH);
@@ -360,6 +421,11 @@ void disp_char(char ch, bool dec_point)
 
     case 'N':  // Pisz N
       shiftOut(dataPin, clockPin, MSBFIRST, 0x12 | !dec_point);
+      digitalWrite(clockPin, HIGH);
+      digitalWrite(clockPin, LOW);
+
+    case '!':  // wykrzyknik
+      shiftOut(dataPin, clockPin, MSBFIRST, 0x9E | dec_point);
       digitalWrite(clockPin, HIGH);
       digitalWrite(clockPin, LOW);
 
